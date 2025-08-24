@@ -1,12 +1,6 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import requests, io
+import requests
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-st.set_page_config(page_title="OneDrive → DataFrame", page_icon="📊", layout="wide")
-
-# -------------------- Helper: nhận diện response là file --------------------
 def _looks_like_file(resp: requests.Response) -> bool:
     ct = (resp.headers.get("Content-Type") or "").lower()
     cd = (resp.headers.get("Content-Disposition") or "").lower()
@@ -18,27 +12,48 @@ def _looks_like_file(resp: requests.Response) -> bool:
     if any(m in ct for m in excel_mimes) or "application/octet-stream" in ct or "attachment" in cd:
         return True
     try:
-        return cl is not None and int(cl) > 1024  # >1KB
+        return cl is not None and int(cl) > 1024
     except Exception:
         return False
 
-# -------------------- Helper: chuyển 1drv.ms → direct download --------------------
-def onedrive_share_to_direct_url(share_link: str, timeout: int = 30) -> str:
+def _try_get(url: str, session: requests.Session, timeout: int = 30) -> requests.Response | None:
+    try:
+        r = session.get(url, allow_redirects=True, timeout=timeout, stream=True)
+        if r.status_code == 200 and _looks_like_file(r):
+            return r
+        return None
+    except requests.exceptions.RequestException:
+        return None
+
+def onedrive_to_direct_url(share_or_embed_link: str, timeout: int = 30) -> str:
     """
-    Trả về link download ẩn danh dùng được với requests.get(...)
-    Thử lần lượt:
-      1) Trích resid/authkey/cid → onedrive.live.com/download?cid=...&resid=...&authkey=...
-      2) Doc.aspx + sourcedoc={GUID} → Download.aspx?UniqueId={GUID}&download=1
-      3) Ép download=1 vào URL cuối
-      4) Nếu chính URL cuối trả file thì dùng URL đó
+    Nhận link 1drv.ms / onedrive.live.com (share hoặc embed) -> trả direct download URL.
+    Chiến lược:
+      A) Nếu là EMBED: embed?resid=...&authkey=...  -> download?resid=...&authkey=...
+      B) Theo redirect từ link share để lấy resid/authkey -> download?...
+      C) Doc.aspx + sourcedoc -> Download.aspx?UniqueId=...
+      D) Nếu Download.aspx ở my.microsoftpersonalcontent.com bị 401 -> đổi sang onedrive.live.com
     """
     s = requests.Session()
-    r = s.get(share_link, allow_redirects=True, timeout=timeout, stream=True)
-    urls = [h.url for h in r.history] + [r.url]
+    u = urlparse(share_or_embed_link)
 
-    # 1) Dựng download?cid=&resid=&authkey=
-    for u in urls:
-        pu = urlparse(u)
+    # A) Link EMBED → DOWNLOAD
+    if "onedrive.live.com" in u.netloc and "/embed" in u.path:
+        q = parse_qs(u.query)
+        resid = (q.get("resid") or [None])[0]
+        authkey = (q.get("authkey") or [None])[0]
+        if resid and authkey:
+            return f"https://onedrive.live.com/download?resid={resid}&authkey={authkey}"
+
+    # B) Theo redirect từ link SHARE
+    r = s.get(share_or_embed_link, allow_redirects=True, timeout=timeout, stream=True)
+    chain = [h.url for h in r.history] + [r.url]
+
+    # B1) bắt resid/authkey/cid ở bất kỳ bước nào
+    for url in chain:
+        pu = urlparse(url)
+        if "onedrive.live.com" not in pu.netloc and "my.microsoftpersonalcontent.com" not in pu.netloc:
+            continue
         q = parse_qs(pu.query)
         resid = (q.get("resid") or [None])[0]
         authkey = (q.get("authkey") or [None])[0]
@@ -46,112 +61,62 @@ def onedrive_share_to_direct_url(share_link: str, timeout: int = 30) -> str:
         if resid and authkey:
             if not cid and "!" in resid:
                 cid = resid.split("!", 1)[0]
-            direct = f"https://onedrive.live.com/download?cid={cid}&resid={resid}&authkey={authkey}"
-            g = s.get(direct, allow_redirects=True, timeout=timeout, stream=True)
-            if g.status_code == 200 and _looks_like_file(g):
-                return direct
-            if 300 <= g.status_code < 400:
-                g2 = s.get(g.headers.get("Location", direct), allow_redirects=True, timeout=timeout, stream=True)
-                if g2.status_code == 200 and _looks_like_file(g2):
-                    return direct
+            return f"https://onedrive.live.com/download?cid={cid}&resid={resid}&authkey={authkey}"
 
-    # 2) Doc.aspx → Download.aspx?UniqueId={GUID}
-    final_url = urls[-1]
+    # C) Dạng Doc.aspx + sourcedoc -> Download.aspx
+    final_url = chain[-1]
     p = urlparse(final_url)
     if p.path.lower().endswith("/_layouts/15/doc.aspx"):
         q = parse_qs(p.query)
         sourcedoc = (q.get("sourcedoc") or [None])[0]  # {GUID}
         if sourcedoc:
-            download_path = p.path.replace("/Doc.aspx", "/Download.aspx")
-            download_qs = {"UniqueId": sourcedoc, "Translate": "false", "download": "1"}
-            direct = urlunparse((p.scheme, p.netloc, download_path, "", urlencode(download_qs), ""))
-            g = s.get(direct, allow_redirects=True, timeout=timeout, stream=True)
-            if g.status_code == 200 and _looks_like_file(g):
-                return direct
+            dl_path = p.path.replace("/Doc.aspx", "/Download.aspx")
+            dl_qs = {"UniqueId": sourcedoc, "Translate": "false", "download": "1"}
+            # ưu tiên onedrive.live.com
+            return urlunparse(("https", "onedrive.live.com", dl_path, "", urlencode(dl_qs), ""))
 
-    # 3) Thêm download=1 vào URL cuối (nếu là onedrive.live.com)
-    if "onedrive.live.com" in p.netloc:
-        q = parse_qs(p.query)
-        if "download" not in q:
-            q["download"] = ["1"]
-            direct = urlunparse((p.scheme, p.netloc, p.path, "", urlencode({k: v[0] for k, v in q.items()}), ""))
-            g = s.get(direct, allow_redirects=True, timeout=timeout, stream=True)
-            if g.status_code == 200 and _looks_like_file(g):
-                return direct
-
-    # 4) Nếu URL cuối trả file thì dùng luôn
+    # D) nếu URL cuối cùng đã trả file thì dùng luôn
     if r.status_code == 200 and _looks_like_file(r):
-        return urls[-1]
+        return chain[-1]
 
-    raise ValueError(
-        "Không thể tạo link download ẩn danh từ link share này. "
-        "Hãy đảm bảo 'Anyone with the link can view' và thử lại."
-    )
+    # nếu không tìm được
+    raise ValueError("Không thể tạo direct URL từ link đã cung cấp.")
 
-# -------------------- UI --------------------
-st.title("📦 OneDrive Share → 📊 Streamlit Dashboard")
+def fetch_onedrive_file(share_or_embed_link: str, timeout: int = 45) -> bytes:
+    """
+    Tạo direct URL rồi tải file. Có fallback chuyển domain my.microsoftpersonalcontent.com -> onedrive.live.com
+    """
+    s = requests.Session()
 
-with st.expander("Nhập link share OneDrive (1drv.ms hoặc onedrive.live.com)"):
-    share_link = st.text_input(
-        "Dán link share tại đây",
-        placeholder="https://1drv.ms/x/...",
-        value=""  # có thể để trống hoặc dán sẵn link mẫu của bạn
-    )
-    colA, colB = st.columns([1,1])
-    with colA:
-        run_btn = st.button("📥 Tải dữ liệu", type="primary")
-    with colB:
-        show_debug = st.toggle("Hiển thị thông tin gỡ lỗi", value=False)
+    # Tạo direct URL
+    direct_url = onedrive_to_direct_url(share_or_embed_link, timeout=timeout)
 
-if run_btn:
-    if not share_link.strip():
-        st.warning("Vui lòng dán link share OneDrive.")
-        st.stop()
+    # Thử GET lần 1
+    r = _try_get(direct_url, s, timeout=timeout)
+    if r:
+        return r.content
 
-    try:
-        direct_url = onedrive_share_to_direct_url(share_link.strip())
-        if show_debug:
-            st.code(f"Direct URL: {direct_url}", language="text")
-    except Exception as e:
-        st.error(f"Không tạo được direct URL: {e}")
-        st.stop()
+    # Fallback: nếu domain là my.microsoftpersonalcontent.com -> đổi sang onedrive.live.com
+    pu = urlparse(direct_url)
+    if "my.microsoftpersonalcontent.com" in pu.netloc:
+        alt = urlunparse((pu.scheme, "onedrive.live.com", pu.path, pu.params, pu.query, pu.fragment))
+        r2 = _try_get(alt, s, timeout=timeout)
+        if r2:
+            return r2.content
 
-    # Tải nội dung
-    try:
-        resp = requests.get(direct_url, timeout=60)
-        resp.raise_for_status()
-        if show_debug:
-            st.write("Response headers:", dict(resp.headers))
-    except requests.exceptions.RequestException as e:
-        st.error(f"Không tải được file từ OneDrive: {e}")
-        if show_debug:
-            st.write("Tried URL:", direct_url)
-        st.stop()
+    # Thử thêm: nếu là download?resid=.. thiếu cid, thêm cid từ resid
+    if "onedrive.live.com" in pu.netloc and "/download" in pu.path:
+        q = parse_qs(pu.query)
+        resid = (q.get("resid") or [None])[0]
+        authkey = (q.get("authkey") or [None])[0]
+        cid = (q.get("cid") or [None])[0]
+        if resid and authkey and not cid and "!" in resid:
+            cid = resid.split("!", 1)[0]
+            q["cid"] = [cid]
+            alt2 = urlunparse((pu.scheme, pu.netloc, pu.path, "", urlencode({k:v[0] for k,v in q.items()}), ""))
+            r3 = _try_get(alt2, s, timeout=timeout)
+            if r3:
+                return r3.content
 
-    # Quyết định đọc CSV hay Excel
-    content_type = (resp.headers.get("Content-Type") or "").lower()
-    dispo = (resp.headers.get("Content-Disposition") or "").lower()
-    filename = ""
-    if "filename=" in dispo:
-        # lấy tên file từ Content-Disposition nếu có
-        filename = dispo.split("filename=", 1)[1].strip('"; ')
-
-    try:
-        if filename.endswith(".csv") or "text/csv" in content_type:
-            df = pd.read_csv(io.BytesIO(resp.content))
-        else:
-            # Mặc định đọc Excel
-            df = pd.read_excel(io.BytesIO(resp.content))
-    except Exception as e:
-        st.error(f"Không đọc được dữ liệu: {e}")
-        st.stop()
-
-    st.success("Đã tải và đọc dữ liệu thành công!")
-    st.dataframe(df, use_container_width=True)
-
-    # Ví dụ vẽ biểu đồ nếu có cột phù hợp
-    if {"Category", "Value"}.issubset(df.columns):
-        fig = px.bar(df, x="Category", y="Value", title="Biểu đồ mẫu")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Thêm 2 cột 'Category' và 'Value' để xem ví dụ biểu đồ, hoặc sửa code để phù hợp dữ liệu của bạn.")
+    # Hết cách
+    raise requests.HTTPError(f"Không tải được file từ OneDrive sau các bước fallback. URL thử: {direct_url}")
