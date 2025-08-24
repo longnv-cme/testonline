@@ -2,15 +2,25 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-# OneDrive public link (direct download)
-onedrive_url = "https://1drv.ms/x/c/139ee0f07655cc68/EZfwgI3AedZOgrWNhd1vEdABZVGlqsN0fwhhL88jamgIOQ?e=oVyVTo"
+# Link share OneDrive (copy từ nút Share)
+onedrive_link = "https://1drv.ms/x/c/139ee0f07655cc68/EZfwgI3AedZOgrWNhd1vEdABZVGlqsN0fwhhL88jamgIOQ?e=oVyVTo"
 
-# Đọc dữ liệu Excel trực tiếp từ OneDrive
-@st.cache_data
-def load_data():
-    return pd.read_excel(onedrive_url)
+# Hàm chuyển đổi link share sang link download trực tiếp
+def get_direct_download_link(share_link):
+    if "1drv.ms" in share_link:
+        base_url = "https://api.onedrive.com/v1.0/shares/u!"
+        link_id = share_link.split("/")[-1].split("?")[0]
+        import base64
+        link_bytes = base64.urlsafe_b64encode(share_link.encode("utf-8"))
+        return f"https://api.onedrive.com/v1.0/shares/u!{link_bytes.decode('utf-8').rstrip('=')}/root/content"
+    return share_link
 
-df = load_data()
+direct_link = get_direct_download_link(onedrive_link)
+
+# Tải file Excel từ OneDrive
+response = requests.get(direct_link)
+df = pd.read_excel(io.BytesIO(response.content))
+
 
 st.title("📊 Dashboard cập nhật từ OneDrive")
 
